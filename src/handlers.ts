@@ -1,5 +1,7 @@
 import { FastifyRequest, FastifyReply } from "fastify";
 import { PokemonWithStats } from "models/PokemonWithStats";
+import { formatWithOptions } from "util";
+const https = require("https");
 
 export async function getPokemonByName(
   request: FastifyRequest,
@@ -9,83 +11,104 @@ export async function getPokemonByName(
 
   reply.headers["Accept"] = "application/json";
 
-  var urlApiPokeman = `https://pokeapi.co/api/v2/pokemon/`;
+  const DOMAIN = "pokeapi.co";
+  var urlApiPokeman = `/api/v2/pokemon/`;
 
-  var params = {};
+  // in case name isn't in the url return bad request error
+  if (name?.trim() === "")
+    reply.code(400).send({ message: "a valid name url parameter is required" });
 
-  name == null
-    ? name.trim() != ""
-      ? ((params["name"] = name), (urlApiPokeman = urlApiPokeman + "/" + name))
-      : ((urlApiPokeman = urlApiPokeman + '"?offset=20"'),
-        (urlApiPokeman = urlApiPokeman + "&limit=20"))
-    : ((urlApiPokeman = urlApiPokeman + '"?offset=20"'),
-      (urlApiPokeman = urlApiPokeman + "&limit=20"));
+  urlApiPokeman += `${name}/?offset=20&limit=20`;
 
-  const http = require("http");
-  const keepAliveAgent = new http.Agent({ keepAlive: true });
+  const keepAliveAgent = new https.Agent({ keepAlive: true });
 
-  let response: any = "";
+  var options = {
+    hostname: DOMAIN,
+    port: 443,
+    path: urlApiPokeman,
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    agent: keepAliveAgent,
+  };
 
-  http.request(
-    { ...reply.headers, ...{ hostname: urlApiPokeman, port: 80 } },
-    (result) => {
-      response = result;
-    }
-  );
+  let response;
 
-  if (response == null) {
-    reply.code(404);
+  try {
+    await https
+      .get(options, (res) => {
+        let data: string = "";
+        res.on("data", (chunk) => (data += chunk));
+        res.on("end", () => {
+          if (res.statusCode != 200)
+            return reply.code(res.statusCode).send({ message: data });
+
+          response = JSON.parse(data);
+          computeResponse(response, reply);
+        });
+      })
+      .on("error", (e) => {
+        throw e;
+      });
+  } catch (error) {
+    return reply
+      .code(error.code ?? 500)
+      .send({ message: error?.message ?? "error while sending to poke api" });
   }
+}
 
-  computeResponse(response, reply);
-
-  reply.send(response);
-
-  return reply;
+interface ResponsePokemon {
+  stats: Array<{
+    base_stat: number;
+    effort: number;
+    stat: { name: string; url: string };
+    averageStat?: number;
+  }>;
+  types: Array<{ slot: number; type: { name: string; url: string } }>;
 }
 
 export const computeResponse = async (
-  response: any, //TODO: fix the type
+  response: ResponsePokemon, //TODO: fix the type
   reply: FastifyReply
 ) => {
-  const resp = response as any;
+  try {
+    const resp = response;
 
-  let types = resp.types
-    .map((type) => type.type)
-    .map((type) => {
-      return type.url;
-    })
-    .reduce((types, typeUrl) => types.push(typeUrl));
+    let types = resp?.types?.map((type) => type?.type).map((type) => type?.url);
 
-  let pokemonTypes = [];
+    let pokemonTypesPromises = types.map(async (typeUrl) => {
+      return new Promise((resolve, _reject) =>
+        https.get(typeUrl, (res) => {
+          let data: string = "";
+          res.on("data", (chunk) => (data += chunk));
+          res.on("end", () => {
+            if (res.statusCode != 200)
+              return reply.code(res.statusCode).send({ message: data });
 
-  types.forEach((element) => {
-    const http = require("http");
-    const keepAliveAgent = new http.Agent({ keepAlive: true });
+            resolve(JSON.parse(data));
+          });
+        })
+      );
+    });
 
-    http.request({ hostname: element }, (response) =>
-      pokemonTypes.push(response)
-    );
-  });
+    await Promise.all(pokemonTypesPromises)
+      .then((pokemonTypes: any) => {
+        const statsResponse = response?.stats;
 
-  if (pokemonTypes == undefined) throw pokemonTypes;
+        const baseStatList = statsResponse.map((stat) => stat.base_stat);
+        const averageBaseStat = baseStatList.reduce((a, b) => a + b);
 
-  response?.stats?.forEach((element) => {
-    var stats = [];
-
-    pokemonTypes.map((pok) =>
-      pok.stats.map((st) =>
-        st.stat.name.toUpperCase() == element.stat.name
-          ? stats.push(st.base_state)
-          : []
-      )
-    );
-
-    if (stats) {
-      let avg = stats.reduce((a, b) => a + b) / stats.length;
-      element.averageStat = avg;
-    } else {
-      element.averageStat = 0;
-    }
-  });
+        return reply
+          .status(200)
+          .send({ data: response, pokemonTypes, averageBaseStat });
+      })
+      .catch((error) => {
+        throw error;
+      });
+  } catch (error) {
+    return reply.code(error?.code ?? 500).send({
+      message: error?.message ?? "error while getting pokemonTypes from api",
+    });
+  }
 };
